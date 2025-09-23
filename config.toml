@@ -1,6 +1,7 @@
 [avito]
-tg_token = ""
-tg_chat_id = []
+# Telegram functionality removed
+# tg_token = ""
+# tg_chat_id = []
 urls = [
     "https://www.avito.ru/all/gruzoviki_i_spetstehnika/buldozery-ASgBAgICAURU3E0?cd=1",
 ]
@@ -11,11 +12,20 @@ seller_black_list = []
 max_price = 9999999999
 min_price = 1000
 geo = ""
+
+# Proxy and IP settings - now configurable
+use_proxy = false
+use_local_ip = true
 proxy_string = ""
 proxy_change_url = ""
+
 pause_general = 60
 pause_between_links = 5
 max_age = 600
 max_count_of_retry = 5
 ignore_reserv = true
 ignore_promotion = false
+
+# Database configuration
+database_type = "sqlite"  # "sqlite" or "postgresql"
+# database_url = "postgresql://user:password@localhost/avito_parser"  # Only for PostgreSQL

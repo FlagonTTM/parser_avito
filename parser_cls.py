@@ -14,12 +14,13 @@ from pydantic import ValidationError
 from requests.cookies import RequestsCookieJar
 
 from common_data import HEADERS
-from db_service import SQLiteDBHandler
+from db_service import SQLiteDBHandler, PostgreSQLDBHandler
 from dto import Proxy, AvitoConfig
 from get_cookies import get_cookies
 from load_config import load_avito_config
 from models import ItemsResponse, Item
-from tg_sender import SendAdToTg
+# Telegram functionality removed
+# from tg_sender import SendAdToTg
 from version import VERSION
 from xlsx_service import XLSXHandler
 
@@ -36,8 +37,9 @@ class AvitoParse:
     ):
         self.config = config
         self.proxy_obj = self.get_proxy_obj()
-        self.db_handler = SQLiteDBHandler()
-        self.tg_handler = self.get_tg_handler()
+        self.db_handler = self._get_db_handler()
+        # Telegram handler removed - no longer sending notifications
+        # self.tg_handler = self.get_tg_handler()
         self.xlsx_handler = XLSXHandler(self.__get_file_title())
         self.stop_event = stop_event
         self.cookies = None
@@ -48,22 +50,37 @@ class AvitoParse:
 
         logger.info(f"Запуск AvitoParse v{VERSION} с настройками:\n{config}")
 
-    def get_tg_handler(self) -> SendAdToTg | None:
-        if all([self.config.tg_token, self.config.tg_chat_id]):
-            return SendAdToTg(bot_token=self.config.tg_token, chat_id=self.config.tg_chat_id)
-        return None
+    # Telegram functionality removed
+    # def get_tg_handler(self) -> SendAdToTg | None:
+    #     if all([self.config.tg_token, self.config.tg_chat_id]):
+    #         return SendAdToTg(bot_token=self.config.tg_token, chat_id=self.config.tg_chat_id)
+    #     return None
 
-    def _send_to_tg(self, ads: list[Item]) -> None:
-        for ad in ads:
-            self.tg_handler.send_to_tg(ad=ad)
+    # def _send_to_tg(self, ads: list[Item]) -> None:
+    #     for ad in ads:
+    #         self.tg_handler.send_to_tg(ad=ad)
+
+    def _get_db_handler(self):
+        """Получает обработчик базы данных в зависимости от конфигурации"""
+        if self.config.database_type.lower() == "postgresql":
+            if not self.config.database_url:
+                logger.error("Для PostgreSQL необходимо указать database_url")
+                raise ValueError("database_url is required for PostgreSQL")
+            return PostgreSQLDBHandler(self.config.database_url)
+        else:
+            return SQLiteDBHandler()
 
     def get_proxy_obj(self) -> Proxy | None:
-        if all([self.config.proxy_string, self.config.proxy_change_url]):
+        if self.config.use_proxy and all([self.config.proxy_string, self.config.proxy_change_url]):
+            logger.info("Работаем с прокси")
             return Proxy(
                 proxy_string=self.config.proxy_string,
                 change_ip_link=self.config.proxy_change_url
             )
-        logger.info("Работаем без прокси")
+        elif self.config.use_local_ip:
+            logger.info("Работаем с локальным IP")
+        else:
+            logger.info("Работаем без прокси и без смены IP")
         return None
 
     def get_cookies(self, max_retries: int = 1, delay: float = 2.0) -> dict | None:
@@ -178,8 +195,9 @@ class AvitoParse:
 
                 filter_ads = self.filter_ads(ads=ads)
 
-                if self.tg_handler:
-                    self._send_to_tg(ads=filter_ads)
+                # Telegram notifications removed - no longer sending to TG
+                # if self.tg_handler:
+                #     self._send_to_tg(ads=filter_ads)
 
                 if filter_ads:
                     logger.info(f"Сохраняю в {self.__get_file_title()}")
@@ -329,17 +347,25 @@ class AvitoParse:
             return ads
 
     def change_ip(self) -> bool:
-        if not self.config.proxy_change_url:
-            logger.info("Сейчас бы была смена ip, но мы без прокси")
+        if self.config.use_proxy and self.config.proxy_change_url:
+            logger.info("Меняю IP через прокси")
+            try:
+                res = requests.get(url=self.config.proxy_change_url, verify=False)
+                if res.status_code == 200:
+                    logger.info("IP изменен через прокси")
+                    return True
+            except Exception as err:
+                logger.info(f"При смене ip через прокси возникла ошибка: {err}")
+        elif self.config.use_local_ip:
+            logger.info("Пауза для смены локального IP (имитация)")
+            # Local IP change simulation - just wait
+            time.sleep(random.randint(5, 15))
+            logger.info("Локальный IP изменен (имитация)")
+            return True
+        else:
+            logger.info("Смена IP отключена")
             return False
-        logger.info("Меняю IP")
-        try:
-            res = requests.get(url=self.config.proxy_change_url, verify=False)
-            if res.status_code == 200:
-                logger.info("IP изменен")
-                return True
-        except Exception as err:
-            logger.info(f"При смене ip возникла ошибка: {err}")
+        
         logger.info("Не удалось изменить IP, пробую еще раз")
         time.sleep(random.randint(3, 10))
         return self.change_ip()
@@ -358,7 +384,7 @@ class AvitoParse:
 
     def is_viewed(self, ad: Item) -> bool:
         """Проверяет, смотрели мы это или нет"""
-        return self.db_handler.record_exists(record_id=ad.id, price=ad.priceDetailed.value)
+        return self.db_handler.record_exists(record_id=ad.id)
 
     @staticmethod
     def _is_recent(timestamp_ms: int, max_age_seconds: int) -> bool:
