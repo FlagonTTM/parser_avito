@@ -1,0 +1,39 @@
+[avito]
+# URLs to parse
+urls = [
+    "https://www.avito.ru/all/gruzoviki_i_spetstehnika/buldozery-ASgBAgICAURU3E0?cd=1",
+]
+
+# Basic settings
+count = 1
+keys_word_white_list = []
+keys_word_black_list = []
+seller_black_list = []
+max_price = 9999999999
+min_price = 1000
+geo = ""
+
+# IP and Proxy settings
+use_proxy = false                # Set to true to use proxy
+use_local_ip = true              # Set to false to disable IP switching
+proxy_string = ""                # Format: "username:password@proxy.server:port"
+proxy_change_url = ""            # URL to change proxy IP
+
+# Timing settings
+pause_general = 60               # Pause between full parsing cycles (seconds)
+pause_between_links = 5          # Pause between processing different URLs (seconds)
+max_age = 600                    # Maximum age of ads to process (seconds)
+max_count_of_retry = 5           # Maximum retry attempts for requests
+
+# Filtering
+ignore_reserv = true             # Ignore reserved items
+ignore_promotion = false         # Ignore promoted items
+
+# Database configuration - PostgreSQL example
+database_type = "postgresql"
+database_url = "postgresql://avito_user:password@localhost:5432/avito_parser"
+
+# Note: Make sure to:
+# 1. Create PostgreSQL database: CREATE DATABASE avito_parser;
+# 2. Create user: CREATE USER avito_user WITH PASSWORD 'password';
+# 3. Grant permissions: GRANT ALL PRIVILEGES ON DATABASE avito_parser TO avito_user;
