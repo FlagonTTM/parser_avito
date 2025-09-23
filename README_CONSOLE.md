@@ -1,138 +1,149 @@
-# Avito Parser - Console Version
+# Avito Parser - Modified Console Version
 
-Modified version of the Avito parser with the following changes according to requirements:
+Modified version of the Avito parser according to specific requirements.
 
-## Changes Made
+## 🎯 Key Changes Made
 
-### ✅ Removed Features
-- ❌ **Telegram notifications** - No more bot integration or message sending
-- ❌ **Price change tracking** - Simplified database to track only processed items (no price history)
-- ❌ **GUI interface** - Console-only operation
+### ❌ Removed Features
+- **Telegram notifications** - No bot integration, no message sending
+- **Price change tracking** - Simplified database (only tracks processed item IDs)  
+- **GUI interface** - Console-only operation (original GUI still available)
 
-### ✅ Added Features  
-- ✅ **PostgreSQL support** - Can now export to PostgreSQL in addition to SQLite
-- ✅ **Local IP switching** - Option to work with local IP instead of proxy
-- ✅ **Configurable proxy usage** - Can enable/disable proxy usage
-- ✅ **Console-only interface** - Simple command-line operation
-- ✅ **Improved configuration** - Better control over features
+### ✅ Added Features
+- **PostgreSQL support** - Export to PostgreSQL in addition to SQLite
+- **Local IP switching** - Option to work with local IP instead of proxy
+- **Configurable proxy usage** - Enable/disable proxy usage via config
+- **Console interface** - Simple command-line operation with options
+- **Improved configuration** - Better control over all features
 
-## Installation
+## 🚀 Quick Start
 
-1. Install dependencies:
+### 1. Installation
 ```bash
+# Install base dependencies
 pip install -r requirements.txt
-```
 
-2. For PostgreSQL support (optional):
-```bash
+# For PostgreSQL support (optional)
 pip install psycopg2-binary
 ```
 
-## Configuration
-
+### 2. Configuration
 Edit `config.toml`:
-
 ```toml
 [avito]
-urls = ["https://www.avito.ru/..."]
+# Basic settings
+urls = ["https://www.avito.ru/your-search-url"]
 
-# Database settings
-database_type = "sqlite"  # or "postgresql"  
-# database_url = "postgresql://user:password@localhost/avito_parser"  # for PostgreSQL
+# Database (choose one)
+database_type = "sqlite"          # Local SQLite file
+# database_type = "postgresql"    # PostgreSQL server
+# database_url = "postgresql://user:pass@host:5432/dbname"
 
-# IP and Proxy settings
-use_proxy = false        # Enable/disable proxy usage
-use_local_ip = true      # Enable local IP switching
-proxy_string = ""        # Proxy configuration (if use_proxy = true)
-proxy_change_url = ""    # Proxy IP change URL (if use_proxy = true)
-
-# Other settings...
-pause_general = 60
-pause_between_links = 5
-# ... (rest of configuration)
+# IP Management (choose one mode)
+use_local_ip = true               # Use local IP with switching simulation
+use_proxy = false                 # Disable proxy
+# use_proxy = true                # Enable proxy mode
+# proxy_string = "user:pass@proxy:port"
+# proxy_change_url = "https://api.proxy.com/change-ip"
 ```
 
-## Usage
-
-### Console Version
+### 3. Usage
 ```bash
 # Run once and exit
 python console_parser.py --once
 
-# Run continuously (loop)
+# Run continuously 
 python console_parser.py
 
-# Use custom config file
+# Custom config file
 python console_parser.py --config my_config.toml
 
 # Verbose logging
 python console_parser.py --verbose
 ```
 
-### Original CLI Version (still works)
-```bash
-python parser_cls.py
-```
-
-## Database Options
+## 📊 Database Options
 
 ### SQLite (Default)
 ```toml
 database_type = "sqlite"
 ```
-Data stored in local `database.db` file.
+- Data stored in local `database.db` file
+- No setup required
+- Perfect for single-user scenarios
 
-### PostgreSQL
+### PostgreSQL  
 ```toml
 database_type = "postgresql"
 database_url = "postgresql://username:password@localhost:5432/avito_parser"
 ```
+- Requires PostgreSQL server
+- Better for multi-user or production environments
+- See `config_postgresql_example.toml` for full example
 
-Make sure PostgreSQL is running and the database exists.
+## 🌐 IP/Proxy Configuration
 
-## IP/Proxy Options
-
-### Local IP (Default)
+### Mode 1: Local IP (Recommended)
 ```toml
 use_proxy = false
 use_local_ip = true
 ```
-Uses local internet connection with IP change simulation.
+- Uses your local internet connection
+- Simulates IP changes with delays
+- No proxy costs
 
-### Proxy Usage
+### Mode 2: Proxy Usage
 ```toml
 use_proxy = true
 use_local_ip = false
 proxy_string = "username:password@proxy.server:port"
 proxy_change_url = "https://api.proxy.com/change-ip?key=..."
 ```
+- Uses external proxy service
+- Real IP changes via API
+- Requires proxy subscription
 
-### No IP Management
+### Mode 3: Direct Connection
 ```toml
 use_proxy = false
 use_local_ip = false
 ```
-No IP changes, direct connection only.
+- Direct connection only
+- No IP management
+- May get blocked faster
 
-## Output
+## 📁 Output Files
 
-- **Excel files**: Saved to `result/` directory
-- **Database**: Item IDs stored to prevent re-processing (no price tracking)
-- **Logs**: Console output and `logs/app.log`
+- **Excel**: `result/*.xlsx` - Parsed ad data
+- **Database**: Item IDs to prevent re-processing
+- **Logs**: `logs/app.log` and console output
 
-## Cross-platform Support
+## 🔄 Migration from Original
 
-The application works on:
-- ✅ Windows
-- ✅ Linux  
+The modified version is **backward compatible**:
+
+- ✅ Existing `config.toml` files work (new settings optional)
+- ✅ Original launchers still work:
+  - `python AvitoParser.py` (GUI version)  
+  - `python parser_cls.py` (original CLI)
+- ❌ Telegram settings are ignored (no errors)
+- ❌ Price tracking disabled (database simplified)
+
+## 🖥️ Cross-Platform Support
+
+Works on:
+- ✅ Windows  
+- ✅ Linux
 - ✅ macOS
 
-## Migration from Original Version
+## ⚙️ Advanced Configuration
 
-The new version is backward compatible with existing configurations, but:
+All original filtering options remain available:
+- Price range filtering
+- Keyword white/black lists
+- Seller black lists  
+- Geographic filtering
+- Age-based filtering
+- Promotion/reservation filtering
 
-1. Telegram settings are ignored (no error, just not used)
-2. Price change tracking is disabled (simplified database schema)
-3. GUI is not available in console version
-
-To use old behavior, run the original `AvitoParser.py` (with GUI) or `parser_cls.py` (original CLI).
+See `config.toml` for complete options.
