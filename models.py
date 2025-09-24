@@ -145,6 +145,14 @@ class Item(BaseModel):
     isSparePartsCompatibility: bool | None = None
     sellerId: str | None = None
     isPromotion: bool = False
+    # Additional fields for detailed job information
+    detailed_description: Optional[str] = None
+    requirements: Optional[str] = None
+    company_info: Optional[str] = None
+    schedule: Optional[str] = None
+    employment_type: Optional[str] = None
+    experience_level: Optional[str] = None
+    is_detailed_parsed: bool = False
 
 
 class ItemsResponse(BaseModel):
