@@ -31,6 +31,12 @@ logs/
 result/
 database.db
 cookies.json
+*.xlsx
+*.xls
+
+# Test files
+test_functionality.py
+response.txt
 
 # Environment
 .env

@@ -28,6 +28,10 @@ ignore_reserv = true
 ignore_promotion = false
 
 # Time range configuration for job parsing
-start_date = ""  # Format: YYYY-MM-DD, e.g., "2024-01-01"
-end_date = ""    # Format: YYYY-MM-DD, e.g., "2024-01-31"  
+start_date = "2024-01-01"  # Format: YYYY-MM-DD, e.g., "2024-01-01"
+end_date = "2024-01-31"    # Format: YYYY-MM-DD, e.g., "2024-01-31"  
 enable_detailed_parsing = true  # Enable parsing individual job pages for detailed info
+
+# Database configuration
+database_type = "sqlite"  # "sqlite" or "postgresql"
+# database_url = "postgresql://user:password@localhost/avito_parser"  # Only for PostgreSQL
