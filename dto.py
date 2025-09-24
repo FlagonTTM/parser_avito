@@ -40,6 +40,10 @@ class AvitoConfig:
     max_count_of_retry: int = 5
     ignore_reserv: bool = True
     ignore_promotion: bool = False
+    # Time range configuration for job parsing
+    start_date: Optional[str] = None  # Format: YYYY-MM-DD
+    end_date: Optional[str] = None    # Format: YYYY-MM-DD
+    enable_detailed_parsing: bool = True  # Enable parsing individual job pages
     # Database configuration
     database_type: str = "sqlite"  # "sqlite" or "postgresql"
     database_url: Optional[str] = None  # For PostgreSQL: "postgresql://user:password@localhost/dbname"

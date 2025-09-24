@@ -194,6 +194,10 @@ class AvitoParse:
                 ads = self._add_seller_to_ads(ads=ads)
 
                 filter_ads = self.filter_ads(ads=ads)
+                
+                # Parse detailed job information if enabled
+                if self.config.enable_detailed_parsing and filter_ads:
+                    filter_ads = self._parse_jobs_with_details(ads=filter_ads)
 
                 # Telegram notifications removed - no longer sending to TG
                 # if self.tg_handler:
@@ -317,15 +321,131 @@ class AvitoParse:
             logger.debug(f"Ошибка при отсеивании объявления с продавцами из черного списка : {err}")
             return ads
 
-    def _filter_by_recent_time(self, ads: list[Item]) -> list[Item]:
-        if not self.config.max_age:
-            return ads
+    def _parse_detailed_job_info(self, ad: Item) -> Item:
+        """Parse detailed job information from individual job page (MVP implementation)"""
+        if not self.config.enable_detailed_parsing or ad.is_detailed_parsed:
+            return ad
+            
         try:
-            return [ad for ad in ads if
-                    self._is_recent(timestamp_ms=ad.sortTimeStamp, max_age_seconds=self.config.max_age)]
+            # Construct full URL for the job listing
+            base_url = "https://www.avito.ru"
+            job_url = f"{base_url}{ad.urlPath}" if ad.urlPath else None
+            
+            if not job_url:
+                return ad
+            
+            logger.debug(f"Parsing detailed info for job: {job_url}")
+            
+            # Fetch the individual job page
+            html_code = self.fetch_data(url=job_url, retries=3)
+            if not html_code:
+                return ad
+            
+            soup = BeautifulSoup(html_code, "html.parser")
+            
+            # Parse detailed description (look for job description sections)
+            description_selectors = [
+                'div[data-marker="item-description-text"]',
+                '.item-description-text',
+                '.item-description',
+                '[data-marker="item-description"] .text-text-LurtD'
+            ]
+            
+            for selector in description_selectors:
+                description_elem = soup.select_one(selector)
+                if description_elem:
+                    ad.detailed_description = description_elem.get_text(strip=True)
+                    break
+            
+            # Try to extract job-specific information from description or structured data
+            if ad.detailed_description or ad.description:
+                text = (ad.detailed_description or ad.description or "").lower()
+                
+                # Extract employment type keywords
+                if any(word in text for word in ['полная занятость', 'полный день', 'полная']):
+                    ad.employment_type = 'Полная занятость'
+                elif any(word in text for word in ['частичная занятость', 'неполный день', 'частичная']):
+                    ad.employment_type = 'Частичная занятость'
+                elif any(word in text for word in ['удаленно', 'удаленная работа', 'remote']):
+                    ad.employment_type = 'Удаленная работа'
+                
+                # Extract experience level
+                if any(word in text for word in ['без опыта', 'опыт не требуется']):
+                    ad.experience_level = 'Без опыта'
+                elif any(word in text for word in ['1-3 года', 'от 1 года', '1 год']):
+                    ad.experience_level = '1-3 года'
+                elif any(word in text for word in ['3-6 лет', 'от 3 лет']):
+                    ad.experience_level = '3-6 лет'
+                elif any(word in text for word in ['от 6 лет', 'более 6 лет']):
+                    ad.experience_level = 'Более 6 лет'
+            
+            ad.is_detailed_parsed = True
+            logger.debug(f"Successfully parsed detailed info for job ID: {ad.id}")
+            
         except Exception as err:
-            logger.debug(f"Ошибка при отсеивании слишком старых объявлений: {err}")
+            logger.debug(f"Ошибка при парсинге детальной информации о вакансии: {err}")
+            
+        return ad
+
+    def _parse_jobs_with_details(self, ads: list[Item]) -> list[Item]:
+        """Parse detailed information for all jobs if enabled"""
+        if not self.config.enable_detailed_parsing:
             return ads
+            
+        detailed_ads = []
+        for i, ad in enumerate(ads):
+            if self.stop_event and self.stop_event.is_set():
+                break
+                
+            logger.info(f"Парсинг детальной информации: {i+1}/{len(ads)}")
+            detailed_ad = self._parse_detailed_job_info(ad)
+            detailed_ads.append(detailed_ad)
+            
+            # Add delay between requests to avoid rate limiting
+            if i < len(ads) - 1:  # Don't sleep after the last item
+                time.sleep(random.randint(2, 5))
+                
+        return detailed_ads
+
+    def _filter_by_date_range(self, ads: list[Item]) -> list[Item]:
+        """Filter jobs by specified date range"""
+        if not (self.config.start_date or self.config.end_date):
+            return ads
+        
+        try:
+            from datetime import datetime, date
+            
+            filtered_ads = []
+            for ad in ads:
+                # Convert timestamp to date
+                ad_date = datetime.utcfromtimestamp(ad.sortTimeStamp / 1000).date()
+                
+                # Check start date
+                if self.config.start_date:
+                    start_date = datetime.strptime(self.config.start_date, '%Y-%m-%d').date()
+                    if ad_date < start_date:
+                        continue
+                
+                # Check end date  
+                if self.config.end_date:
+                    end_date = datetime.strptime(self.config.end_date, '%Y-%m-%d').date()
+                    if ad_date > end_date:
+                        continue
+                        
+                filtered_ads.append(ad)
+                
+            return filtered_ads
+            
+        except Exception as err:
+            logger.debug(f"Ошибка при фильтрации по диапазону дат: {err}")
+            return ads
+
+    def _filter_by_recent_time(self, ads: list[Item]) -> list[Item]:
+        # Time filtering removed - now supports parsing jobs for specific date ranges
+        # Filter logic moved to date range filtering if configured
+        if self.config.start_date or self.config.end_date:
+            return self._filter_by_date_range(ads)
+        return ads
 
     def _filter_by_reserve(self, ads: list[Item]) -> list[Item]:
         if not self.config.ignore_reserv:

@@ -8,7 +8,8 @@ from loguru import logger
 from lang import *
 from load_config import save_avito_config, load_avito_config
 from parser_cls import AvitoParse
-from tg_sender import SendAdToTg
+# Telegram functionality removed
+# from tg_sender import SendAdToTg
 from version import VERSION
 
 
