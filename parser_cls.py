@@ -62,6 +62,7 @@ class AvitoParse:
         self.selenium_driver = None
         self._selenium_lock = threading.RLock()
         self._last_saved_cookies_snapshot: dict[str, str] | None = None
+        self._cookies_supports_user_agent = True
 
         self._initialize_proxy_pool()
 
@@ -262,6 +263,22 @@ class AvitoParse:
 
     def _refresh_cookies_and_user_agent(self) -> bool:
         """Обновляет cookies и user-agent с помощью Playwright."""
+        switched = False
+        if len(self.proxy_pool) > 1:
+            switched = self._switch_proxy()
+        elif self.proxy_obj and getattr(self.proxy_obj, "rotation_pool", []):
+            rotation_pool = [
+                self._sanitize_proxy_string(proxy)
+                for proxy in getattr(self.proxy_obj, "rotation_pool", [])
+                if proxy
+            ]
+            if rotation_pool and len(rotation_pool) > 1:
+                self.config.proxy_pool = rotation_pool
+                self.proxy_pool = rotation_pool
+                switched = self._switch_proxy()
+        if switched:
+            logger.info("Сменили прокси перед обновлением cookies после 403")
+
         new_user_agent = self._select_user_agent()
         self._current_user_agent = new_user_agent
         self._update_headers_user_agent(new_user_agent)
@@ -303,13 +320,7 @@ class AvitoParse:
     def _fetch_cookies(self):
         """Получает cookies, учитывая возможное наличие активного event loop."""
         try:
-            return asyncio.run(
-                get_cookies(
-                    proxy=self.proxy_obj,
-                    headless=True,
-                    user_agent=self._current_user_agent,
-                )
-            )
+            return asyncio.run(self._get_cookies_async())
         except RuntimeError as exc:
             if "asyncio.run()" in str(exc):
                 loop = asyncio.new_event_loop()
@@ -319,17 +330,42 @@ class AvitoParse:
                     except RuntimeError:
                         previous_loop = None
                     asyncio.set_event_loop(loop)
-                    return loop.run_until_complete(
-                        get_cookies(
-                            proxy=self.proxy_obj,
-                            headless=True,
-                            user_agent=self._current_user_agent,
-                        )
-                    )
+                    return loop.run_until_complete(self._get_cookies_async())
                 finally:
                     asyncio.set_event_loop(previous_loop)
                     loop.close()
             raise
+
+    async def _get_cookies_async(self):
+        """Асинхронно получает cookies, учитывая возможное отсутствие параметра user_agent."""
+        if self._cookies_supports_user_agent:
+            try:
+                result = await get_cookies(
+                    proxy=self.proxy_obj,
+                    headless=True,
+                    user_agent=self._current_user_agent,
+                )
+            except TypeError as exc:
+                if "unexpected keyword argument 'user_agent'" in str(exc):
+                    logger.debug("Функция get_cookies не поддерживает параметр user_agent, повторяем без него")
+                    self._cookies_supports_user_agent = False
+                else:
+                    raise
+            else:
+                return self._normalize_cookies_result(result)
+
+        result = await get_cookies(proxy=self.proxy_obj, headless=True)
+        return self._normalize_cookies_result(result)
+
+    def _normalize_cookies_result(self, result):
+        """Приводит результат get_cookies к формату (cookies, user_agent)."""
+        if isinstance(result, tuple) and len(result) == 2:
+            cookies, user_agent = result
+            normalized_agent = str(user_agent) if user_agent is not None else self._current_user_agent
+            return cookies or {}, normalized_agent
+        if isinstance(result, dict):
+            return result, self._current_user_agent
+        return {}, self._current_user_agent
 
     def get_cookies(self, max_retries: int = 3, delay: float = 2.0) -> dict | None:
         for attempt in range(1, max_retries + 1):
