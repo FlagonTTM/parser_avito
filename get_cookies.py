@@ -153,6 +153,10 @@ class PlaywrightClient:
             await asyncio.sleep(RETRY_DELAY_WITHOUT_PROXY)
             return False
         if not self.proxy_split_obj.change_ip_link:
+            rotation_pool = getattr(self.proxy, "rotation_pool", []) if self.proxy else []
+            if rotation_pool and len(rotation_pool) > 1:
+                logger.info("Переключение на следующий прокси будет выполнено основным парсером")
+                return False
             logger.info("Провайдер прокси не поддерживает смену IP по API — делаем паузу")
             await asyncio.sleep(RETRY_DELAY)
             return False
