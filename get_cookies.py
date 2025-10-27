@@ -156,9 +156,19 @@ class PlaywrightClient:
             logger.info("Провайдер прокси не поддерживает смену IP по API — делаем паузу")
             await asyncio.sleep(RETRY_DELAY)
             return False
+        if self.proxy_split_obj.change_ip_link:
+            base_link = str(self.proxy_split_obj.change_ip_link)
+            separator = "&" if "?" in base_link else "?"
+            change_url = f"{base_link}{separator}format=json"
+        else:
+            change_url = None
+
         for attempt in range(1, retries + 1):
             try:
-                response = httpx.get(self.proxy_split_obj.change_ip_link + "&format=json", timeout=20)
+                if not change_url:
+                    logger.error("Не задан URL для смены IP")
+                    return False
+                response = httpx.get(change_url, timeout=20)
                 if response.status_code == 200:
                     logger.info(f"IP изменён на {response.json().get('new_ip')}")
                     return True
