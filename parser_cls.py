@@ -30,10 +30,6 @@ from load_config import load_avito_config
 logger.add("logs/app.log", rotation="5 MB", retention="5 days", level="DEBUG")
 
 
-class ForbiddenError(Exception):
-    """Raised when access to a URL is forbidden (HTTP 403)."""
-
-
 class AvitoParse:
     """Главный класс, отвечающий за парсинг Avito."""
 
@@ -47,7 +43,6 @@ class AvitoParse:
 
         self.proxy_obj = self.get_proxy_obj()
         self.db_handler = self._get_db_handler()
-        self.xlsx_handler = XLSXHandler(self.__get_file_title())
 
         self.session = self._create_session()
         self.headers = HEADERS.copy()
@@ -59,6 +54,7 @@ class AvitoParse:
         self.current_proxy: str | None = None
         self.proxy_index = 0
         self.consecutive_429 = 0
+        self.consecutive_403 = 0
 
         self.error_count: dict[str, int] = {}
         self.good_request_count = 0
@@ -138,11 +134,22 @@ class AvitoParse:
 
         primary_proxy = candidate_pool[0] if candidate_pool else None
 
-        return Proxy(
-            proxy_string=primary_proxy,
-            change_ip_link=change_ip_link,
-            rotation_pool=candidate_pool or ([primary_proxy] if primary_proxy else []),
-        )
+        rotation_pool = candidate_pool or ([primary_proxy] if primary_proxy else [])
+        proxy_kwargs: dict[str, object] = {"proxy_string": primary_proxy}
+        if change_ip_link:
+            proxy_kwargs["change_ip_link"] = change_ip_link
+        if rotation_pool:
+            proxy_kwargs["rotation_pool"] = rotation_pool
+
+        try:
+            return Proxy(**proxy_kwargs)  # type: ignore[arg-type]
+        except TypeError:
+            proxy = Proxy(
+                proxy_kwargs["proxy_string"],  # type: ignore[arg-type]
+                proxy_kwargs.get("change_ip_link"),
+            )
+            setattr(proxy, "rotation_pool", rotation_pool)
+            return proxy
 
     @staticmethod
     def _sanitize_proxy_string(proxy: str) -> str:
@@ -169,8 +176,9 @@ class AvitoParse:
             self.current_proxy = None
             return
 
-        raw_pool = self.proxy_obj.rotation_pool or []
-        if not raw_pool and self.proxy_obj.proxy_string:
+        raw_pool = getattr(self.proxy_obj, "rotation_pool", []) or []
+        proxy_string = getattr(self.proxy_obj, "proxy_string", None)
+        if not raw_pool and proxy_string:
             raw_pool = [self.proxy_obj.proxy_string]
 
         self.proxy_pool = [
@@ -182,7 +190,7 @@ class AvitoParse:
             self.proxy_index = 0
             self.current_proxy = self.proxy_pool[self.proxy_index]
             if self.proxy_obj:
-                self.proxy_obj.rotation_pool = self.proxy_pool
+                setattr(self.proxy_obj, "rotation_pool", self.proxy_pool)
                 self.proxy_obj.proxy_string = self.current_proxy
             self.config.proxy_string = self.current_proxy
             self.config.proxy_pool = self.proxy_pool
@@ -252,6 +260,20 @@ class AvitoParse:
         except Exception as exc:
             logger.warning(f"Не удалось применить cookies к сессии: {exc}")
 
+    def _refresh_cookies_and_user_agent(self) -> bool:
+        """Обновляет cookies и user-agent с помощью Playwright."""
+        new_user_agent = self._select_user_agent()
+        self._current_user_agent = new_user_agent
+        self._update_headers_user_agent(new_user_agent)
+        cookies = self.get_cookies()
+        if cookies:
+            self.save_cookies()
+            logger.info("Обновлены cookies и user-agent после повторных 403")
+            return True
+        self._apply_cookies_to_session(None)
+        logger.warning("Не удалось обновить cookies после 403")
+        return False
+
     def _switch_proxy(self) -> bool:
         """Переключается на следующий прокси из пула."""
         if len(self.proxy_pool) <= 1:
@@ -263,7 +285,7 @@ class AvitoParse:
 
         if self.proxy_obj:
             self.proxy_obj.proxy_string = self.current_proxy
-            self.proxy_obj.rotation_pool = self.proxy_pool
+            setattr(self.proxy_obj, "rotation_pool", self.proxy_pool)
 
         self.config.proxy_string = self.current_proxy
         self.config.proxy_pool = self.proxy_pool
@@ -380,7 +402,16 @@ class AvitoParse:
 
                 if status_code == 403:
                     self.bad_request_count += 1
-                    raise ForbiddenError(url)
+                    self.consecutive_403 += 1
+                    logger.warning(
+                        f"Получен 403 Forbidden, попытка {attempt} (подряд: {self.consecutive_403})"
+                    )
+                    if attempt >= 2:
+                        self._refresh_cookies_and_user_agent()
+                    sleep_time = max(2, backoff_factor * attempt)
+                    time.sleep(sleep_time)
+                    attempt += 1
+                    continue
 
                 if status_code == 429:
                     self.bad_request_count += 1
@@ -394,6 +425,7 @@ class AvitoParse:
                     if self.consecutive_429 >= 2:
                         if self._switch_proxy():
                             logger.info("Сменили прокси после повторных 429")
+                    self.consecutive_403 = 0
                     sleep_time = max(5, backoff_factor * attempt)
                     time.sleep(sleep_time)
                     attempt += 1
@@ -401,6 +433,7 @@ class AvitoParse:
 
                 if status_code in (302,):
                     self.consecutive_429 = 0
+                    self.consecutive_403 = 0
                     new_cookies = self.get_cookies()
                     if new_cookies:
                         self.save_cookies()
@@ -415,10 +448,9 @@ class AvitoParse:
                 self.save_cookies()
                 self.good_request_count += 1
                 self.consecutive_429 = 0
+                self.consecutive_403 = 0
                 return response.text
 
-            except ForbiddenError:
-                raise
             except requests.errors.RequestsError as exc:
                 logger.debug(f"Попытка {attempt} закончилась неуспешно: {exc}")
                 if attempt < retries:
@@ -527,10 +559,6 @@ class AvitoParse:
 
         try:
             html_code = self.fetch_data(url=url, retries=self.config.max_count_of_retry)
-        except ForbiddenError:
-            logger.warning(f"Получен 403 для URL {url}, пропускаем и переходим к следующему")
-            self._reset_error(url)
-            return None
         except Exception as exc:
             attempts = self._increment_error(url)
             logger.error(f"Ошибка при парсинге через requests URL {url}: {exc}")
@@ -895,12 +923,6 @@ class AvitoParse:
             return match.group(1)
         return None
 
-    def __get_file_title(self) -> str:
-        """Определяет название файла"""
-        title_file = 'all'
-        if self.config.keys_word_white_list:
-            title_file = "-".join(list(map(str.lower, self.config.keys_word_white_list)))
-        return f"result/{title_file}.xlsx"
 def signal_handler(sig, frame):
     """Обработчик сигнала Ctrl+C"""
     print('\nПолучен сигнал завершения (Ctrl+C)...')
