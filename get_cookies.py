@@ -80,6 +80,30 @@ class PlaywrightClient:
     @staticmethod
     def parse_cookie_string(cookie_str: str) -> dict:
         return dict(pair.split("=", 1) for pair in cookie_str.split("; ") if "=" in pair)
+    async def _restart_browser(self):
+        """Закрывает текущий браузер и запускает новый с обновленными настройками."""
+        try:
+            if self.page:
+                await self.page.close()
+        except Exception:
+            pass
+        finally:
+            self.page = None
+        try:
+            if self.context:
+                await self.context.close()
+        except Exception:
+            pass
+        finally:
+            self.context = None
+        try:
+            if self.browser:
+                await self.browser.close()
+        except Exception:
+            pass
+        finally:
+            self.browser = None
+        await self.launch_browser()
     async def launch_browser(self):
         stealth = Stealth()
         self.playwright_context = stealth.use_async(async_playwright())
@@ -118,7 +142,9 @@ class PlaywrightClient:
         await self.page.goto(url=url, timeout=60_000,
                              wait_until="domcontentloaded")
         for attempt in range(10):
-            await self.check_block(self.page, self.context)
+            if await self.check_block(url):
+                await asyncio.sleep(2)
+                continue
             raw_cookie = await self.page.evaluate("() => document.cookie")
             cookie_dict = self.parse_cookie_string(raw_cookie)
             if cookie_dict.get("ft"):
@@ -139,24 +165,36 @@ class PlaywrightClient:
                 await self.playwright.stop()
     async def get_cookies(self, url: str) -> dict:
         return await self.extract_cookies(url)
-    async def check_block(self, page, context):
-        title = await page.title()
+    async def check_block(self, url: str) -> bool:
+        if not self.page:
+            return False
+        title = await self.page.title()
         logger.info(f"Не ошибка, а название страницы: {title}")
         if BAD_IP_TITLE in str(title).lower():
             logger.info("IP заблокирован")
-            await context.clear_cookies()
-            await self.change_ip()
-            await page.reload(timeout=60*1000)
+            if self.context:
+                try:
+                    await self.context.clear_cookies()
+                except Exception:
+                    pass
+            proxy_switched = await self.change_ip()
+            if proxy_switched:
+                await self.page.goto(url=url, timeout=60_000, wait_until="domcontentloaded")
+            else:
+                await self.page.reload(timeout=60_000)
+            return True
+        return False
     async def change_ip(self, retries: int = MAX_RETRIES):
         if not self.proxy_split_obj:
             logger.info("Сейчас бы сменили ip, но прокси нет - поэтому ждем")
             await asyncio.sleep(RETRY_DELAY_WITHOUT_PROXY)
             return False
+        rotation_pool = getattr(self.proxy, "rotation_pool", []) if self.proxy else []
+        rotated_locally = await self._rotate_local_proxy(rotation_pool)
+        if rotated_locally:
+            logger.info("Переключились на следующий прокси из пула")
+            return True
         if not self.proxy_split_obj.change_ip_link:
-            rotation_pool = getattr(self.proxy, "rotation_pool", []) if self.proxy else []
-            if rotation_pool and len(rotation_pool) > 1:
-                logger.info("Переключение на следующий прокси будет выполнено основным парсером")
-                return False
             logger.info("Провайдер прокси не поддерживает смену IP по API — делаем паузу")
             await asyncio.sleep(RETRY_DELAY)
             return False
@@ -189,6 +227,28 @@ class PlaywrightClient:
             else:
                 logger.error("Превышено количество попыток смены IP")
                 return False
+    async def _rotate_local_proxy(self, rotation_pool: List[str]) -> bool:
+        if not rotation_pool or len(rotation_pool) <= 1:
+            return False
+        sanitized_pool = [self.del_protocol(proxy) for proxy in rotation_pool if proxy]
+        if len(sanitized_pool) <= 1:
+            return False
+        current = self.del_protocol(self.proxy.proxy_string) if self.proxy and self.proxy.proxy_string else None
+        try:
+            current_index = sanitized_pool.index(current) if current else -1
+        except ValueError:
+            current_index = -1
+        next_index = (current_index + 1) % len(sanitized_pool)
+        if current_index == next_index and current_index != -1:
+            return False
+        next_proxy = sanitized_pool[next_index]
+        logger.info(f"Переключаюсь на следующий прокси из пула: {next_proxy}")
+        if self.proxy:
+            self.proxy.proxy_string = next_proxy
+            setattr(self.proxy, "rotation_pool", sanitized_pool)
+        self.proxy_split_obj = self.get_proxy_obj()
+        await self._restart_browser()
+        return True
     @staticmethod
     async def _stealth(page):
         await page.add_init_script("""
