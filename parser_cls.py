@@ -18,6 +18,7 @@ from requests.cookies import RequestsCookieJar
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -35,6 +36,7 @@ class AvitoParse:
 
     BATCH_SIZE = 5
     MAX_CONSECUTIVE_429 = 3
+    IDENTITY_BOOT_DELAY = 3
 
     def __init__(self, config: AvitoConfig, stop_event: threading.Event | None = None):
         self.config = config
@@ -63,6 +65,8 @@ class AvitoParse:
         self._selenium_lock = threading.RLock()
         self._last_saved_cookies_snapshot: dict[str, str] | None = None
         self._cookies_supports_user_agent = True
+        self.mobile_rotation_endpoint = self._detect_mobile_rotation_endpoint()
+        self._identity_lock = threading.RLock()
 
         self._initialize_proxy_pool()
 
@@ -215,6 +219,15 @@ class AvitoParse:
             return None
         return {"http": formatted, "https": formatted}
 
+    def _detect_mobile_rotation_endpoint(self) -> str | None:
+        """Определяет endpoint для смены IP мобильного прокси."""
+        endpoint = getattr(self.config, "proxy_change_url", None)
+        if isinstance(endpoint, str):
+            stripped = endpoint.strip()
+            if stripped:
+                return stripped
+        return None
+
     def _select_user_agent(self) -> str:
         """Выбирает user-agent для HTTP-сессии."""
         if USER_AGENTS:
@@ -261,37 +274,43 @@ class AvitoParse:
         except Exception as exc:
             logger.warning(f"Не удалось применить cookies к сессии: {exc}")
 
-    def _refresh_cookies_and_user_agent(self) -> bool:
-        """Обновляет cookies и user-agent с помощью Playwright."""
-        switched = False
-        if len(self.proxy_pool) > 1:
-            switched = self._switch_proxy()
-        elif self.proxy_obj and getattr(self.proxy_obj, "rotation_pool", []):
-            rotation_pool = [
-                self._sanitize_proxy_string(proxy)
-                for proxy in getattr(self.proxy_obj, "rotation_pool", [])
-                if proxy
-            ]
-            if rotation_pool and len(rotation_pool) > 1:
-                self.config.proxy_pool = rotation_pool
-                self.proxy_pool = rotation_pool
-                switched = self._switch_proxy()
-        if switched:
-            logger.info("Сменили прокси перед обновлением cookies после 403")
+    def _refresh_identity(self, reason: str = "") -> bool:
+        """Полностью обновляет прокси, user-agent, cookies и перезапускает Selenium."""
+        with self._identity_lock:
+            logger.info(f"Обновление идентичности{' (' + reason + ')' if reason else ''}")
+            self._rotate_proxy(reason)
+            self._apply_cookies_to_session(None)
+            new_user_agent = self._select_user_agent()
+            self._current_user_agent = new_user_agent
+            self._update_headers_user_agent(new_user_agent)
+            cookies = self.get_cookies()
+            if cookies:
+                self.save_cookies()
+            else:
+                logger.warning("Не удалось получить новые cookies — продолжаем с текущими настройками")
+            self._restart_selenium()
+            time.sleep(self.IDENTITY_BOOT_DELAY)
+            return bool(cookies)
 
-        new_user_agent = self._select_user_agent()
-        self._current_user_agent = new_user_agent
-        self._update_headers_user_agent(new_user_agent)
-        cookies = self.get_cookies()
-        if cookies:
-            self.save_cookies()
-            logger.info("Обновлены cookies и user-agent после повторных 403")
-            return True
-        self._apply_cookies_to_session(None)
-        logger.warning("Не удалось обновить cookies после 403")
-        return False
+    def _rotate_proxy(self, reason: str = "") -> None:
+        """Пытается сменить IP мобильного прокси или переключить пул."""
+        rotation_url = self.mobile_rotation_endpoint
+        if rotation_url:
+            try:
+                logger.info(f"Запрос смены IP у мобильного прокси по адресу {rotation_url} ({reason or 'manual'})")
+                response = requests.get(rotation_url, timeout=20, verify=False)
+                if response.status_code == 200:
+                    logger.info("Провайдер подтвердил смену IP (заглушка)")
+                else:
+                    logger.warning(f"Не удалось сменить IP (статус {response.status_code}), пробуем переключить пул")
+                    self._advance_proxy_pool()
+            except Exception as exc:
+                logger.warning(f"Ошибка при обращении к endpoint смены IP: {exc}")
+                self._advance_proxy_pool()
+        else:
+            self._advance_proxy_pool()
 
-    def _switch_proxy(self) -> bool:
+    def _advance_proxy_pool(self) -> bool:
         """Переключается на следующий прокси из пула."""
         if len(self.proxy_pool) <= 1:
             logger.warning("Недостаточно прокси для переключения")
@@ -443,7 +462,7 @@ class AvitoParse:
                         f"Получен 403 Forbidden, попытка {attempt} (подряд: {self.consecutive_403})"
                     )
                     if attempt >= 2:
-                        self._refresh_cookies_and_user_agent()
+                        self._refresh_identity("HTTP 403")
                     sleep_time = max(2, backoff_factor * attempt)
                     time.sleep(sleep_time)
                     attempt += 1
@@ -459,7 +478,7 @@ class AvitoParse:
                     if new_cookies:
                         self.save_cookies()
                     if self.consecutive_429 >= 2:
-                        if self._switch_proxy():
+                        if self._advance_proxy_pool():
                             logger.info("Сменили прокси после повторных 429")
                     self.consecutive_403 = 0
                     sleep_time = max(5, backoff_factor * attempt)
@@ -679,6 +698,7 @@ class AvitoParse:
 
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 time.sleep(scroll_pause_time)
+                self._simulate_human_interaction(driver)
 
                 html_content = driver.page_source
                 if html_content:
@@ -719,6 +739,23 @@ class AvitoParse:
                 finally:
                     self.selenium_driver = None
                 logger.info("Selenium WebDriver закрыт")
+
+    def _restart_selenium(self, warmup_url: str | None = None) -> None:
+        """Перезапускает Selenium с обновленными настройками и подготавливает сессию."""
+        self.close_selenium_driver()
+        self.init_selenium_driver()
+        with self._selenium_lock:
+            driver = self.selenium_driver
+        if not driver:
+            logger.warning("Не удалось инициализировать Selenium после смены IP")
+            return
+        warmup = warmup_url or "https://www.avito.ru/all/vakansii"
+        try:
+            driver.get(warmup)
+            time.sleep(random.uniform(1.0, 2.0))
+            self._simulate_human_interaction(driver, warmup=True)
+        except Exception as exc:
+            logger.debug(f"Warmup Selenium завершился с ошибкой: {exc}")
 
     def scroll_page_with_selenium(self, url, scroll_pause_time=10, scroll_iterations=10, cookies=None):
         """Прокрутка страницы с контролируемой скоростью и двусторонней прокруткой"""
@@ -771,6 +808,38 @@ class AvitoParse:
         scroll_thread.start()
         logger.info(f"Прокрутка запущена в фоне для: {url}")
         return scroll_thread
+
+    def _simulate_human_interaction(self, driver, warmup: bool = False) -> None:
+        """Имитация пользовательских действий для снижения детектирования бота."""
+        try:
+            actions = ActionChains(driver)
+            viewport_height = driver.execute_script("return window.innerHeight || document.documentElement.clientHeight;")
+            scroll_steps = random.randint(3, 6)
+            for _ in range(scroll_steps):
+                delta = random.randint(int(viewport_height * 0.2), int(viewport_height * 0.6))
+                driver.execute_script("window.scrollBy(0, arguments[0]);", delta)
+                time.sleep(random.uniform(0.6, 1.4))
+            driver.execute_script("window.scrollBy(0, -arguments[0]);", random.randint(int(viewport_height * 0.1), int(viewport_height * 0.3)))
+            time.sleep(random.uniform(0.5, 1.0))
+
+            clickable = driver.find_elements(By.CSS_SELECTOR, "a[href], button")
+            if clickable:
+                random.shuffle(clickable)
+                for element in clickable[:3]:
+                    try:
+                        driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", element)
+                        time.sleep(random.uniform(0.5, 1.0))
+                        actions.move_to_element(element).pause(random.uniform(0.2, 0.5)).perform()
+                        if not warmup and element.is_enabled() and element.is_displayed():
+                            element.click()
+                            time.sleep(random.uniform(1.0, 2.0))
+                            driver.back()
+                            WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                            break
+                    except Exception:
+                        continue
+        except Exception as exc:
+            logger.debug(f"Не удалось имитировать поведение пользователя: {exc}")
 
     def _parse_detailed_job_info(self, html_content: str, url: str):
         """Извлекает данные о вакансии из HTML-страницы."""
@@ -915,41 +984,7 @@ class AvitoParse:
 
     def change_ip(self, max_attempts: int = 3) -> bool:
         """Пробует сменить IP согласно настройкам конфигурации."""
-        if self.proxy_pool and len(self.proxy_pool) > 1:
-            logger.info("Переключаюсь на другой прокси из пула")
-            return self._switch_proxy()
-
-        change_link = None
-        if self.proxy_obj and self.proxy_obj.change_ip_link:
-            change_link = self.proxy_obj.change_ip_link
-        elif isinstance(self.config.proxy_change_url, str):
-            candidate = self.config.proxy_change_url.strip()
-            if candidate.lower().startswith(("http://", "https://")):
-                change_link = candidate
-
-        if change_link:
-            logger.info("Меняю IP через API провайдера прокси")
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    response = requests.get(change_link, timeout=20, verify=False, proxies=None)
-                    if response.status_code == 200:
-                        logger.info("IP изменен через провайдера прокси")
-                        return True
-                    logger.warning(f"Не удалось сменить IP (статус {response.status_code}), попытка {attempt}")
-                except Exception as err:
-                    logger.info(f"При смене IP через прокси возникла ошибка: {err} (попытка {attempt})")
-                time.sleep(random.randint(3, 10))
-            logger.warning("Не удалось изменить IP через API провайдера")
-            return False
-
-        if self.config.use_local_ip:
-            logger.info("Пауза для локальной сети")
-            # Local IP change simulation - just wait
-            time.sleep(random.randint(5, 15))
-            logger.info("Пауза закончена")
-            return True
-        logger.info("Смена IP отключена")
-        return False
+        return self._refresh_identity("manual request")
 
     # Методы, которые используются в процессе парсинга
     @staticmethod
