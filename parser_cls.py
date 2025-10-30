@@ -22,7 +22,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from common_date import HEADERS
+from common_data import HEADERS
 from db_service import PostgreSQLDBHandler
 from dto import Proxy, AvitoConfig
 from get_cookies import USER_AGENTS, get_cookies
@@ -36,7 +36,7 @@ class AvitoParse:
 
     BATCH_SIZE = 5
     MAX_CONSECUTIVE_429 = 3
-    IDENTITY_BOOT_DELAY = 3
+    IDENTITY_BOOT_DELAY = 2
 
     def __init__(self, config: AvitoConfig, stop_event: threading.Event | None = None):
         self.config = config
@@ -67,6 +67,7 @@ class AvitoParse:
         self._cookies_supports_user_agent = True
         self.mobile_rotation_endpoint = self._detect_mobile_rotation_endpoint()
         self._identity_lock = threading.RLock()
+        self._proxy_http_version = 2  # стартуем с HTTP/2 для прокси-сессий
 
         self._initialize_proxy_pool()
 
@@ -279,6 +280,7 @@ class AvitoParse:
         with self._identity_lock:
             logger.info(f"Обновление идентичности{' (' + reason + ')' if reason else ''}")
             self._rotate_proxy(reason)
+            self._proxy_http_version = 2
             self._apply_cookies_to_session(None)
             new_user_agent = self._select_user_agent()
             self._current_user_agent = new_user_agent
@@ -296,16 +298,32 @@ class AvitoParse:
         """Пытается сменить IP мобильного прокси или переключить пул."""
         rotation_url = self.mobile_rotation_endpoint
         if rotation_url:
-            try:
-                logger.info(f"Запрос смены IP у мобильного прокси по адресу {rotation_url} ({reason or 'manual'})")
-                response = requests.get(rotation_url, timeout=20, verify=False)
-                if response.status_code == 200:
-                    logger.info("Провайдер подтвердил смену IP (заглушка)")
-                else:
-                    logger.warning(f"Не удалось сменить IP (статус {response.status_code}), пробуем переключить пул")
-                    self._advance_proxy_pool()
-            except Exception as exc:
-                logger.warning(f"Ошибка при обращении к endpoint смены IP: {exc}")
+            for attempt in range(1, 4):
+                try:
+                    logger.info(f"[{attempt}/3] Запрос смены IP у мобильного прокси ({reason or 'manual'})")
+                    response = requests.get(
+                        rotation_url,
+                        timeout=15,
+                        verify=False,
+                        proxies=None,
+                        allow_redirects=True,
+                    )
+                    if response.status_code == 200:
+                        try:
+                            payload = response.json()
+                            new_ip = payload.get("new_ip")
+                        except Exception:
+                            new_ip = None
+                        logger.info(f"Провайдер подтвердил смену IP{f' -> {new_ip}' if new_ip else ''}")
+                        time.sleep(2)
+                        self._update_session_proxy()
+                        break
+                    logger.warning(f"Не удалось сменить IP (статус {response.status_code})")
+                except Exception as exc:
+                    logger.warning(f"Ошибка при обращении к endpoint смены IP: {exc}")
+                time.sleep(attempt * 2)
+            else:
+                logger.warning("Все попытки смены IP исчерпаны, переключаюсь на резервный прокси")
                 self._advance_proxy_pool()
         else:
             self._advance_proxy_pool()
@@ -313,7 +331,7 @@ class AvitoParse:
     def _advance_proxy_pool(self) -> bool:
         """Переключается на следующий прокси из пула."""
         if len(self.proxy_pool) <= 1:
-            logger.warning("Недостаточно прокси для переключения")
+            logger.info("Резервный пул прокси отсутствует")
             return False
 
         self.proxy_index = (self.proxy_index + 1) % len(self.proxy_pool)
@@ -441,6 +459,7 @@ class AvitoParse:
         while attempt <= retries:
             proxy_data = self._build_proxies()
             try:
+                http_version = self._proxy_http_version if proxy_data else 3
                 response = self.session.get(
                     url=url,
                     headers=self.headers,
@@ -449,11 +468,18 @@ class AvitoParse:
                     impersonate="chrome",
                     timeout=20,
                     verify=False,
-                    http_version=3,
+                    http_version=http_version,
                     allow_redirects=True,
                 )
                 status_code = response.status_code
                 logger.debug(f"Попытка {attempt}: {status_code}")
+
+                if status_code == 502 and proxy_data:
+                    logger.warning("Получен 502 от прокси, понижаю версию HTTP и обновляю идентичность")
+                    self._proxy_http_version = 1
+                    self._refresh_identity("proxy 502 status")
+                    attempt += 1
+                    continue
 
                 if status_code == 403:
                     self.bad_request_count += 1
@@ -474,15 +500,11 @@ class AvitoParse:
                     logger.warning(
                         f"Получен 429 Too Many Requests, попытка {attempt} (подряд: {self.consecutive_429})"
                     )
-                    new_cookies = self.get_cookies()
-                    if new_cookies:
-                        self.save_cookies()
-                    if self.consecutive_429 >= 2:
-                        if self._advance_proxy_pool():
-                            logger.info("Сменили прокси после повторных 429")
+                    if self.consecutive_429 == 1:
+                        time.sleep(max(2, backoff_factor * attempt))
+                    else:
+                        self._refresh_identity("HTTP 429")
                     self.consecutive_403 = 0
-                    sleep_time = max(5, backoff_factor * attempt)
-                    time.sleep(sleep_time)
                     attempt += 1
                     continue
 
@@ -508,6 +530,10 @@ class AvitoParse:
 
             except requests.errors.RequestsError as exc:
                 logger.debug(f"Попытка {attempt} закончилась неуспешно: {exc}")
+                if "response 502" in str(exc).lower():
+                    logger.warning("Получен ответ 502 от прокси, обновляю идентичность")
+                    self._proxy_http_version = 1
+                    self._refresh_identity("proxy 502")
                 if attempt < retries:
                     sleep_time = backoff_factor * attempt
                     logger.debug(f"Повтор через {sleep_time} секунд...")
