@@ -139,18 +139,18 @@ class PlaywrightClient:
         self.page = await self.context.new_page()
         await self._stealth(self.page)
     async def load_page(self, url: str):
-        await self.page.goto(url=url, timeout=60_000,
-                             wait_until="domcontentloaded")
-        for attempt in range(10):
+        await self.page.goto(url=url, timeout=60_000, wait_until="domcontentloaded")
+        for attempt in range(8):
             if await self.check_block(url):
-                await asyncio.sleep(2)
+                url = self._random_listing_url()
+                await asyncio.sleep(1.5)
                 continue
             raw_cookie = await self.page.evaluate("() => document.cookie")
             cookie_dict = self.parse_cookie_string(raw_cookie)
             if cookie_dict.get("ft"):
                 logger.info("Cookies получены")
                 return cookie_dict
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
         logger.warning("Не удалось получить cookies")
         return {}
     async def extract_cookies(self, url: str) -> dict:
@@ -177,11 +177,8 @@ class PlaywrightClient:
                     await self.context.clear_cookies()
                 except Exception:
                     pass
-            proxy_switched = await self.change_ip()
-            if proxy_switched:
-                await self.page.goto(url=url, timeout=60_000, wait_until="domcontentloaded")
-            else:
-                await self.page.reload(timeout=60_000)
+            await self.change_ip()
+            await self.page.goto(self._random_listing_url(), timeout=60_000, wait_until="domcontentloaded")
             return True
         return False
     async def change_ip(self, retries: int = MAX_RETRIES):
@@ -194,25 +191,23 @@ class PlaywrightClient:
         if rotated_locally:
             logger.info("Переключились на следующий прокси из пула")
             return True
-        if not self.proxy_split_obj.change_ip_link:
+        change_url = self._build_change_url()
+        if not change_url:
             logger.info("Провайдер прокси не поддерживает смену IP по API — делаем паузу")
             await asyncio.sleep(RETRY_DELAY)
             return False
-        if self.proxy_split_obj.change_ip_link:
-            base_link = str(self.proxy_split_obj.change_ip_link)
-            separator = "&" if "?" in base_link else "?"
-            change_url = f"{base_link}{separator}format=json"
-        else:
-            change_url = None
 
         for attempt in range(1, retries + 1):
             try:
-                if not change_url:
-                    logger.error("Не задан URL для смены IP")
-                    return False
-                response = httpx.get(change_url, timeout=20)
+                response = httpx.get(change_url, timeout=15, verify=False, proxies=None)
                 if response.status_code == 200:
-                    logger.info(f"IP изменён на {response.json().get('new_ip')}")
+                    try:
+                        payload = response.json()
+                        new_ip = payload.get("new_ip")
+                    except Exception:
+                        new_ip = None
+                    logger.info(f"IP изменён на {new_ip or 'неизвестный'}")
+                    await asyncio.sleep(2)
                     return True
                 else:
                     logger.warning(f"[{attempt}/{retries}] Ошибка смены IP: {response.status_code}")
@@ -227,6 +222,7 @@ class PlaywrightClient:
             else:
                 logger.error("Превышено количество попыток смены IP")
                 return False
+        return False
     async def _rotate_local_proxy(self, rotation_pool: List[str]) -> bool:
         if not rotation_pool or len(rotation_pool) <= 1:
             return False
@@ -249,6 +245,17 @@ class PlaywrightClient:
         self.proxy_split_obj = self.get_proxy_obj()
         await self._restart_browser()
         return True
+    def _build_change_url(self) -> Optional[str]:
+        if not self.proxy_split_obj or not self.proxy_split_obj.change_ip_link:
+            return None
+        base_link = str(self.proxy_split_obj.change_ip_link).strip()
+        if not base_link:
+            return None
+        separator = "&" if "?" in base_link else "?"
+        return f"{base_link}{separator}format=json"
+    def _random_listing_url(self) -> str:
+        ads_id = random.randint(1111111111, 9999999999)
+        return f"https://www.avito.ru/{ads_id}"
     @staticmethod
     async def _stealth(page):
         await page.add_init_script("""
