@@ -42,6 +42,10 @@ class AvitoParse:
     KEEPALIVE_INTERVAL = 50
     PLAYWRIGHT_REFRESH_INTERVAL = 240
     SELENIUM_ROUTE_INTERVAL = 180
+    SELENIUM_SCROLL_ITER_RANGE = (4, 7)
+    SELENIUM_SCROLL_PAUSE_RANGE = (1.5, 3.0)
+    SELENIUM_BG_SCROLL_ITER_RANGE = (3, 5)
+    SELENIUM_BG_SCROLL_PAUSE_RANGE = (2.0, 4.0)
     REFERER_POOL = [
         "https://www.avito.ru/",
         "https://www.avito.ru/moskva",
@@ -90,6 +94,7 @@ class AvitoParse:
         self._last_selenium_route = 0.0
         self._processed_counter = 0
         self._parse_start_ts = time.time()
+        self._first_request_ts: float | None = None
 
         self._initialize_proxy_pool()
 
@@ -646,6 +651,10 @@ class AvitoParse:
                 self.good_request_count += 1
                 self.consecutive_429 = 0
                 self.consecutive_403 = 0
+                if self._first_request_ts is None:
+                    self._first_request_ts = time.time()
+                    startup_delay = self._first_request_ts - self._parse_start_ts
+                    logger.info(f"Стартовый цикл до первого ответа занял {startup_delay:.1f} с")
                 return response.text
 
             except requests.errors.RequestsError as exc:
@@ -719,6 +728,7 @@ class AvitoParse:
         """Основной цикл парсинга URL."""
         self.load_cookies()
         self._parse_start_ts = time.time()
+        self._first_request_ts = None
         urls = self._collect_urls()
         if not urls:
             logger.error("Не найдено URL для парсинга")
@@ -836,8 +846,8 @@ class AvitoParse:
                 )
 
                 total_height = driver.execute_script("return document.body.scrollHeight")
-                scroll_pause_time = 10
-                scroll_iterations = 10
+                scroll_iterations = random.randint(*self.SELENIUM_SCROLL_ITER_RANGE)
+                scroll_pause_time = random.uniform(*self.SELENIUM_SCROLL_PAUSE_RANGE)
 
                 for _ in range(scroll_iterations):
                     if self._should_stop():
@@ -931,18 +941,20 @@ class AvitoParse:
                     EC.presence_of_element_located((By.TAG_NAME, "body"))
                 )
                 total_height = driver.execute_script("return document.body.scrollHeight")
-                for _ in range(scroll_iterations):
+                iterations = random.randint(*self.SELENIUM_BG_SCROLL_ITER_RANGE)
+                pause = random.uniform(*self.SELENIUM_BG_SCROLL_PAUSE_RANGE)
+                for _ in range(iterations):
                     if self._should_stop():
                         break
                     driver.execute_script(f"window.scrollBy(0, {total_height * 0.05});")
-                    time.sleep(scroll_pause_time)
-                for _ in range(scroll_iterations):
+                    time.sleep(pause)
+                for _ in range(iterations):
                     if self._should_stop():
                         break
                     driver.execute_script(f"window.scrollBy(0, -{total_height * 0.1});")
-                    time.sleep(scroll_pause_time)
+                    time.sleep(pause)
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(scroll_pause_time)
+                time.sleep(pause)
                 return driver.page_source
             except Exception as e:
                 logger.error(f"Ошибка при прокрутке страницы: {e}")
