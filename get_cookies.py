@@ -4,8 +4,8 @@ import random
 import httpx
 from loguru import logger
 from playwright.async_api import async_playwright
+from playwright.async_api import Error as PlaywrightError
 from playwright_stealth import Stealth
-import playwright
 from typing import Optional, Dict, List
 
 from dto import Proxy, ProxySplit
@@ -90,9 +90,48 @@ class PlaywrightClient:
         await self.close()
         await self.ensure_browser()
     async def ensure_browser(self):
-        if self.browser:
+        if not self.browser or not getattr(self.browser, "is_connected", lambda: False)():
+            await self.launch_browser()
             return
-        await self.launch_browser()
+        if self.context is None or getattr(self.context, "is_closed", lambda: True)():
+            await self._recreate_context()
+            return
+        if self.page is None or getattr(self.page, "is_closed", lambda: True)():
+            await self._recreate_page()
+
+    async def _recreate_context(self):
+        if self.context and not getattr(self.context, "is_closed", lambda: True)():
+            try:
+                await self.context.close()
+            except Exception:
+                pass
+        context_args = {
+            "user_agent": self.user_agent,
+            "viewport": {"width": 1920, "height": 1080},
+            "screen": {"width": 1920, "height": 1080},
+            "device_scale_factor": 1,
+            "is_mobile": False,
+            "has_touch": False,
+        }
+        if self.proxy_split_obj:
+            context_args["proxy"] = {
+                "server": self.proxy_split_obj.ip_port,
+                "username": self.proxy_split_obj.login,
+                "password": self.proxy_split_obj.password
+            }
+        self.context = await self.browser.new_context(**context_args)
+        await self._recreate_page()
+
+    async def _recreate_page(self):
+        if self.context is None:
+            return
+        if self.page and not getattr(self.page, "is_closed", lambda: True)():
+            try:
+                await self.page.close()
+            except Exception:
+                pass
+        self.page = await self.context.new_page()
+        await self._stealth(self.page)
     async def close(self):
         try:
             if self.page:
@@ -139,33 +178,34 @@ class PlaywrightClient:
                 "--window-size=1920,1080",
             ]
         }
-        self.browser = await playwright.chromium.launch(**launch_args)
-        context_args = {
-            "user_agent": self.user_agent,
-            "viewport": {"width": 1920, "height": 1080},
-            "screen": {"width": 1920, "height": 1080},
-            "device_scale_factor": 1,
-            "is_mobile": False,
-            "has_touch": False,
-        }
-        if self.proxy_split_obj:
-            context_args["proxy"] = {
-                "server": self.proxy_split_obj.ip_port,
-                "username": self.proxy_split_obj.login,
-                "password": self.proxy_split_obj.password
-            }
-        self.context = await self.browser.new_context(**context_args)
-        self.page = await self.context.new_page()
-        await self._stealth(self.page)
+        self.browser = await self.playwright.chromium.launch(**launch_args)
+        await self._recreate_context()
     async def load_page(self, url: str):
-        await self.ensure_browser()
-        await self.page.goto(url=url, timeout=60_000, wait_until="domcontentloaded")
         for attempt in range(6):
+            await self.ensure_browser()
+            try:
+                assert self.page
+                await self.page.goto(url=url, timeout=60_000, wait_until="domcontentloaded")
+            except PlaywrightError as exc:
+                logger.debug(f"[Playwright load_page] Ошибка при переходе на {url}: {exc}")
+                await self._restart_browser()
+                await asyncio.sleep(1.0)
+                continue
+            except Exception as exc:
+                logger.debug(f"[Playwright load_page] Неожиданная ошибка при переходе на {url}: {exc}")
+                await asyncio.sleep(1.0)
+                continue
             if await self.check_block(url):
                 url = self._random_listing_url()
                 await asyncio.sleep(1.5)
                 continue
-            raw_cookie = await self.page.evaluate("() => document.cookie")
+            try:
+                raw_cookie = await self.page.evaluate("() => document.cookie")
+            except PlaywrightError as exc:
+                logger.debug(f"[Playwright load_page] Не удалось прочитать cookies: {exc}")
+                await self._restart_browser()
+                await asyncio.sleep(1.0)
+                continue
             cookie_dict = self.parse_cookie_string(raw_cookie)
             if cookie_dict.get("ft"):
                 logger.info("Cookies получены")
@@ -183,7 +223,12 @@ class PlaywrightClient:
     async def check_block(self, url: str) -> bool:
         if not self.page:
             return False
-        title = await self.page.title()
+        try:
+            title = await self.page.title()
+        except PlaywrightError as exc:
+            logger.debug(f"[Playwright check_block] Не удалось получить title: {exc}")
+            await self._restart_browser()
+            return True
         logger.info(f"Не ошибка, а название страницы: {title}")
         if BAD_IP_TITLE in str(title).lower():
             logger.info("IP заблокирован")
@@ -193,7 +238,11 @@ class PlaywrightClient:
                 except Exception:
                     pass
             await self.change_ip()
-            await self.page.goto(self._random_listing_url(), timeout=60_000, wait_until="domcontentloaded")
+            try:
+                await self.page.goto(self._random_listing_url(), timeout=60_000, wait_until="domcontentloaded")
+            except PlaywrightError as exc:
+                logger.debug(f"[Playwright check_block] Ошибка при переходе после смены IP: {exc}")
+                await self._restart_browser()
             return True
         return False
     async def change_ip(self, retries: int = MAX_RETRIES):
@@ -344,12 +393,19 @@ class PlaywrightManager:
     def __init__(self):
         self.client: Optional[PlaywrightClient] = None
         self.lock = asyncio.Lock()
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.last_cookie_refresh = 0.0
         self.last_humanize = 0.0
         self.cookie_refresh_interval = 240.0
         self.humanize_interval = 300.0
 
     async def _ensure_client(self, proxy: Proxy | None, user_agent: Optional[str]):
+        current_loop = asyncio.get_running_loop()
+        if self.loop and self.loop is not current_loop:
+            if self.client:
+                await self.client.close()
+            self.client = None
+        self.loop = current_loop
         if self.client and not self.client.is_compatible(proxy, user_agent):
             await self.client.close()
             self.client = None
@@ -387,6 +443,7 @@ class PlaywrightManager:
             if self.client:
                 await self.client.close()
                 self.client = None
+            self.loop = None
 
 
 _manager = PlaywrightManager()
