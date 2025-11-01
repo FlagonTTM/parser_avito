@@ -21,11 +21,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import TimeoutException, NoSuchWindowException, WebDriverException
 
-from common_data import HEADERS
+from common_date import HEADERS
 from db_service import PostgreSQLDBHandler
 from dto import Proxy, AvitoConfig
-from get_cookies import USER_AGENTS, get_cookies
+from get_cookies import USER_AGENTS, get_cookies, humanized_browse, ensure_playwright_alive
 from load_config import load_avito_config
 
 logger.add("logs/app.log", rotation="5 MB", retention="5 days", level="DEBUG")
@@ -36,7 +37,19 @@ class AvitoParse:
 
     BATCH_SIZE = 5
     MAX_CONSECUTIVE_429 = 3
-    IDENTITY_BOOT_DELAY = 2
+    IDENTITY_BOOT_DELAY = 1
+    USER_AGENT_ROTATION_INTERVAL = 150
+    KEEPALIVE_INTERVAL = 50
+    PLAYWRIGHT_REFRESH_INTERVAL = 240
+    SELENIUM_ROUTE_INTERVAL = 180
+    REFERER_POOL = [
+        "https://www.avito.ru/",
+        "https://www.avito.ru/moskva",
+        "https://www.avito.ru/moskva/vakansii",
+        "https://www.avito.ru/rossiya/transport",
+        "https://www.avito.ru/rossiya/bytovaya_elektronika",
+        "https://www.avito.ru/irkutsk/nedvizhimost",
+    ]
 
     def __init__(self, config: AvitoConfig, stop_event: threading.Event | None = None):
         self.config = config
@@ -68,6 +81,15 @@ class AvitoParse:
         self.mobile_rotation_endpoint = self._detect_mobile_rotation_endpoint()
         self._identity_lock = threading.RLock()
         self._proxy_http_version = 2  # стартуем с HTTP/2 для прокси-сессий
+        self._last_identity_refresh = 0.0
+        self._request_counter = 0
+        self._next_user_agent_rotation = random.randint(40, self.USER_AGENT_ROTATION_INTERVAL)
+        self._last_keepalive_ts = time.time()
+        self._last_referer = None
+        self._last_playwright_touch = 0.0
+        self._last_selenium_route = 0.0
+        self._processed_counter = 0
+        self._parse_start_ts = time.time()
 
         self._initialize_proxy_pool()
 
@@ -220,6 +242,85 @@ class AvitoParse:
             return None
         return {"http": formatted, "https": formatted}
 
+    def _prepare_request_cycle(self) -> None:
+        """Делает запрос менее предсказуемым: пауза, referer, keepalive, ротация UA."""
+        time.sleep(random.uniform(0.3, 0.8))
+        self._request_counter += 1
+        if random.random() < 0.5:
+            referer = random.choice(self.REFERER_POOL)
+            self.headers["referer"] = referer
+            self._last_referer = referer
+        elif random.random() < 0.2:
+            self.headers.pop("referer", None)
+        if self._request_counter >= self._next_user_agent_rotation:
+            self._next_user_agent_rotation = self._request_counter + random.randint(40, self.USER_AGENT_ROTATION_INTERVAL)
+            new_ua = self._select_user_agent()
+            self._current_user_agent = new_ua
+            self._update_headers_user_agent(new_ua)
+        if (
+            self._request_counter % self.KEEPALIVE_INTERVAL == 0
+            or time.time() - self._last_keepalive_ts > 120
+        ):
+            self._perform_keepalive_visit()
+
+    def _perform_keepalive_visit(self) -> None:
+        """Раз в несколько запросов делаем лёгкий визит на общих страницах."""
+        keep_url = random.choice(self.REFERER_POOL)
+        try:
+            self.session.get(
+                url=self._decorate_url(keep_url),
+                headers=self.headers,
+                proxies=self._build_proxies(),
+                timeout=10,
+                verify=False,
+                http_version=self._proxy_http_version,
+                allow_redirects=True,
+            )
+        except Exception:
+            pass
+        finally:
+            self._last_keepalive_ts = time.time()
+
+    def _decorate_url(self, url: str) -> str:
+        """Иногда добавляет к URL псевдо-человеческие параметры."""
+        if random.random() < 0.35:
+            delimiter = "&" if "?" in url else "?"
+            param_name = random.choice(["from", "i", "utm_source", "s"])
+            value = random.randint(1000, 999999)
+            return f"{url}{delimiter}{param_name}={value}"
+        return url
+
+    def _maybe_refresh_playwright(self):
+        if not self.proxy_obj:
+            return
+        if time.time() - self._last_playwright_touch < self.PLAYWRIGHT_REFRESH_INTERVAL:
+            return
+        try:
+            asyncio.run(ensure_playwright_alive(self.proxy_obj, self._current_user_agent))
+        except Exception as exc:
+            logger.debug(f"Не удалось обновить фонового Playwright: {exc}")
+        else:
+            self._last_playwright_touch = time.time()
+
+    def _playwright_humanize(self, routes: list[str] | None = None, reason: str = ""):
+        if not self.proxy_obj:
+            return
+        try:
+            asyncio.run(humanized_browse(self.proxy_obj, self._current_user_agent, routes))
+        except Exception as exc:
+            logger.debug(f"Не удалось выполнить humanized_browse ({reason}): {exc}")
+        else:
+            self._last_playwright_touch = time.time()
+
+    def _log_throughput(self, processed: int):
+        if processed == 0 or processed % 100 != 0:
+            return
+        elapsed = time.time() - self._parse_start_ts
+        if elapsed <= 0:
+            return
+        rps = processed / elapsed
+        logger.info(f"Средняя скорость {rps:.2f} req/s (~{rps * 3600:.0f} URL/час)")
+
     def _detect_mobile_rotation_endpoint(self) -> str | None:
         """Определяет endpoint для смены IP мобильного прокси."""
         endpoint = getattr(self.config, "proxy_change_url", None)
@@ -291,7 +392,21 @@ class AvitoParse:
             else:
                 logger.warning("Не удалось получить новые cookies — продолжаем с текущими настройками")
             self._restart_selenium()
+            self._last_selenium_route = 0.0
+            warm_routes = [
+                "https://www.avito.ru/",
+                random.choice([
+                    "https://www.avito.ru/moskva",
+                    "https://www.avito.ru/moskva/vakansii",
+                    "https://www.avito.ru/irkutsk/nedvizhimost",
+                    "https://www.avito.ru/rossiya/bytovaya_elektronika",
+                    self._decorate_url("https://www.avito.ru/moskva/rabota")
+                ]),
+                self._decorate_url("https://www.avito.ru/" + str(random.randint(1111111111, 9999999999)))
+            ]
+            self._playwright_humanize(routes=warm_routes, reason=reason)
             time.sleep(self.IDENTITY_BOOT_DELAY)
+            self._last_identity_refresh = time.time()
             return bool(cookies)
 
     def _rotate_proxy(self, reason: str = "") -> None:
@@ -305,7 +420,6 @@ class AvitoParse:
                         rotation_url,
                         timeout=15,
                         verify=False,
-                        proxies=None,
                         allow_redirects=True,
                     )
                     if response.status_code == 200:
@@ -459,9 +573,11 @@ class AvitoParse:
         while attempt <= retries:
             proxy_data = self._build_proxies()
             try:
+                self._prepare_request_cycle()
+                request_url = self._decorate_url(url)
                 http_version = self._proxy_http_version if proxy_data else 3
                 response = self.session.get(
-                    url=url,
+                    url=request_url,
                     headers=self.headers,
                     proxies=proxy_data,
                     cookies=self.cookies,
@@ -503,7 +619,11 @@ class AvitoParse:
                     if self.consecutive_429 == 1:
                         time.sleep(max(2, backoff_factor * attempt))
                     else:
-                        self._refresh_identity("HTTP 429")
+                        if time.time() - self._last_identity_refresh < 45:
+                            logger.info("Недавно обновляли идентичность, делаю паузу вместо повторного Playwright")
+                            time.sleep(max(3, backoff_factor * (attempt + 1)))
+                        else:
+                            self._refresh_identity("HTTP 429")
                     self.consecutive_403 = 0
                     attempt += 1
                     continue
@@ -598,6 +718,7 @@ class AvitoParse:
     def parse(self) -> None:
         """Основной цикл парсинга URL."""
         self.load_cookies()
+        self._parse_start_ts = time.time()
         urls = self._collect_urls()
         if not urls:
             logger.error("Не найдено URL для парсинга")
@@ -613,10 +734,13 @@ class AvitoParse:
             if self._should_stop():
                 logger.info("Получен сигнал остановки, завершаем парсинг")
                 break
+            self._maybe_refresh_playwright()
 
             result = self.fetch_and_parse(url)
             if result:
                 batch.append(result)
+                self._processed_counter += 1
+                self._log_throughput(self._processed_counter)
 
             if len(batch) >= self.BATCH_SIZE:
                 logger.info(f"Сохраняем пачку из {len(batch)} записей")
@@ -697,6 +821,11 @@ class AvitoParse:
                 return None
 
             try:
+                now_ts = time.time()
+                if not self._last_selenium_route or now_ts - self._last_selenium_route > self.SELENIUM_ROUTE_INTERVAL:
+                    self._selenium_prepare_route(driver)
+                    self._last_selenium_route = time.time()
+
                 driver.get(url)
                 self._apply_cookies_to_driver(cookies)
                 if cookies:
@@ -725,8 +854,9 @@ class AvitoParse:
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 time.sleep(scroll_pause_time)
                 self._simulate_human_interaction(driver)
-
+                self._selenium_explore_tabs(driver)
                 html_content = driver.page_source
+                self._selenium_try_related(driver, url)
                 if html_content:
                     return self._parse_detailed_job_info(html_content, url)
                 return None
@@ -780,6 +910,7 @@ class AvitoParse:
             driver.get(warmup)
             time.sleep(random.uniform(1.0, 2.0))
             self._simulate_human_interaction(driver, warmup=True)
+            self._selenium_warm_route(driver)
         except Exception as exc:
             logger.debug(f"Warmup Selenium завершился с ошибкой: {exc}")
 
@@ -866,6 +997,237 @@ class AvitoParse:
                         continue
         except Exception as exc:
             logger.debug(f"Не удалось имитировать поведение пользователя: {exc}")
+
+    def _selenium_open_and_humanize(self, driver, url: str, click_filter: bool = False) -> None:
+        """Открывает вспомогательную страницу в новой вкладке и имитирует действия."""
+        main_handle = None
+        child_handle = None
+        try:
+            main_handle = driver.current_window_handle
+            driver.execute_script("window.open(arguments[0], '_blank');", url)
+            time.sleep(random.uniform(1.0, 1.8))
+            driver.switch_to.window(driver.window_handles[-1])
+            child_handle = driver.current_window_handle
+            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            time.sleep(random.uniform(0.8, 1.4))
+            self._simulate_human_interaction(driver, warmup=True)
+            if click_filter:
+                self._selenium_click_random_filter(driver)
+            time.sleep(random.uniform(0.6, 1.2))
+        except Exception as exc:
+            logger.debug(f"Не удалось обработать вспомогательный URL {url}: {exc}")
+        finally:
+            try:
+                if child_handle and child_handle in driver.window_handles:
+                    driver.switch_to.window(child_handle)
+                    driver.close()
+            except (NoSuchWindowException, WebDriverException):
+                pass
+            try:
+                if main_handle and main_handle in driver.window_handles:
+                    driver.switch_to.window(main_handle)
+            except (NoSuchWindowException, WebDriverException):
+                pass
+
+    def _selenium_click_random_filter(self, driver) -> None:
+        """Пытается открыть фильтр или раскрыть блок на странице."""
+        try:
+            candidates = []
+            selectors = [
+                (By.CSS_SELECTOR, "[data-marker='filters-popup/trigger']"),
+                (By.CSS_SELECTOR, "button[data-marker*='search-form/filters']"),
+                (By.XPATH, "//button[contains(normalize-space(string(.)), 'Фильтр')]"),
+                (By.XPATH, "//button[contains(normalize-space(string(.)), 'Показать ещё')]"),
+                (By.XPATH, "//span[contains(normalize-space(string(.)), 'Фильтры')]/ancestor::button"),
+                (By.XPATH, "//button[contains(normalize-space(string(.)), 'Ещё')]"),
+            ]
+            for by, value in selectors:
+                elements = driver.find_elements(by, value)
+                for element in elements:
+                    if element.is_displayed() and element.is_enabled():
+                        candidates.append(element)
+            random.shuffle(candidates)
+            for element in candidates[:3]:
+                try:
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", element
+                    )
+                    time.sleep(random.uniform(0.4, 0.8))
+                    element.click()
+                    time.sleep(random.uniform(0.8, 1.5))
+                    break
+                except Exception:
+                    continue
+        except Exception as exc:
+            logger.debug(f"Не удалось взаимодействовать с фильтрами: {exc}")
+
+    def _selenium_prepare_route(self, driver) -> None:
+        """Выполняет маршрут перед загрузкой целевой страницы."""
+        try:
+            driver.get("https://www.avito.ru/")
+            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            time.sleep(random.uniform(1.0, 1.8))
+            self._simulate_human_interaction(driver, warmup=True)
+
+            city_candidates = [
+                "https://www.avito.ru/moskva",
+                "https://www.avito.ru/sankt-peterburg",
+                "https://www.avito.ru/ekaterinburg",
+                "https://www.avito.ru/novosibirsk",
+            ]
+            city_url = random.choice(city_candidates)
+            driver.get(city_url)
+            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            time.sleep(random.uniform(1.0, 1.6))
+            self._simulate_human_interaction(driver, warmup=True)
+
+            listing_candidates = [
+                "https://www.avito.ru/all/vakansii",
+                "https://www.avito.ru/rossiya/rabota",
+                "https://www.avito.ru/moskva/vakansii",
+                "https://www.avito.ru/rossiya/bytovaya_elektronika",
+            ]
+            listing_url = random.choice(listing_candidates)
+            driver.get(listing_url)
+            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            time.sleep(random.uniform(1.0, 1.6))
+            self._simulate_human_interaction(driver, warmup=True)
+            self._selenium_click_random_filter(driver)
+
+            links = driver.find_elements(By.CSS_SELECTOR, "a[href^='https://www.avito.ru/']")
+            random.shuffle(links)
+            for link in links[:5]:
+                try:
+                    href = link.get_attribute("href")
+                    if not href or "/profile/" in href or href.endswith("#"):
+                        continue
+                    self._selenium_open_and_humanize(driver, href)
+                    break
+                except Exception:
+                    continue
+        except Exception as exc:
+            logger.debug(f"Не удалось выполнить маршрут Selenium: {exc}")
+
+    def _selenium_open_contacts(self, driver) -> None:
+        """Пытается раскрыть контакты в карточке."""
+        try:
+            keywords = ("Показать телефон", "Контакты", "Позвонить", "Написать")
+            selectors = [
+                (By.CSS_SELECTOR, "[data-marker='item-contact-bar/button']"),
+                (By.CSS_SELECTOR, "[data-marker='item-contact-bar/show-number']"),
+                (By.CSS_SELECTOR, "[data-marker='item-contact-bar/call']"),
+            ]
+            candidates = []
+            for by, value in selectors:
+                candidates.extend(driver.find_elements(by, value))
+            for keyword in keywords:
+                candidates.extend(
+                    driver.find_elements(
+                        By.XPATH,
+                        f"//button[contains(normalize-space(string(.)), '{keyword}')]"
+                    )
+                )
+                candidates.extend(
+                    driver.find_elements(
+                        By.XPATH,
+                        f"//a[contains(normalize-space(string(.)), '{keyword}')]"
+                    )
+                )
+            random.shuffle(candidates)
+            for element in candidates[:4]:
+                if not element.is_displayed() or not element.is_enabled():
+                    continue
+                try:
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", element
+                    )
+                    time.sleep(random.uniform(0.4, 0.8))
+                    element.click()
+                    time.sleep(random.uniform(0.8, 1.4))
+                    break
+                except Exception:
+                    continue
+        except Exception as exc:
+            logger.debug(f"Не удалось открыть контакты: {exc}")
+
+    def _selenium_explore_tabs(self, driver) -> None:
+        """Переключает вкладки в карточке объявления."""
+        try:
+            keywords = ("Описание", "Характеристики", "Контакты", "Компания", "Отзывы")
+            for keyword in keywords:
+                elements = driver.find_elements(
+                    By.XPATH,
+                    f"//a[contains(normalize-space(string(.)), '{keyword}')] | "
+                    f"//button[contains(normalize-space(string(.)), '{keyword}')]"
+                )
+                random.shuffle(elements)
+                for element in elements:
+                    if not element.is_displayed() or not element.is_enabled():
+                        continue
+                    try:
+                        driver.execute_script(
+                            "arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", element
+                        )
+                        time.sleep(random.uniform(0.4, 0.9))
+                        ActionChains(driver).move_to_element(element).pause(
+                            random.uniform(0.2, 0.5)
+                        ).perform()
+                        element.click()
+                        time.sleep(random.uniform(0.9, 1.5))
+                        if "контакт" in keyword.lower():
+                            self._selenium_open_contacts(driver)
+                        break
+                    except Exception:
+                        continue
+        except Exception as exc:
+            logger.debug(f"Не удалось переключить вкладки Selenium: {exc}")
+
+    def _selenium_try_related(self, driver, origin_url: str) -> None:
+        """Открывает похожие объявления или разделы."""
+        try:
+            selectors = [
+                "[data-marker='item-view/aside-similar'] a[href]",
+                "[data-marker='item-view/aside-similar-item'] a[href]",
+                "[data-marker='item-view/aside-sold'] a[href]",
+                "a[href*='/vakansii/'][data-marker]",
+            ]
+            random.shuffle(selectors)
+            opened = False
+            for selector in selectors:
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                random.shuffle(elements)
+                for element in elements:
+                    href = element.get_attribute("href")
+                    if not href or "javascript" in href or not href.startswith("https://www.avito.ru/"):
+                        continue
+                    self._selenium_open_and_humanize(driver, href)
+                    opened = True
+                    break
+                if opened:
+                    break
+
+            if not opened:
+                route_url = random.choice([
+                    "https://www.avito.ru/all/vakansii",
+                    "https://www.avito.ru/moskva/vakansii",
+                    "https://www.avito.ru/rossiya/rabota",
+                    random.choice(self.REFERER_POOL),
+                ])
+                self._selenium_open_and_humanize(driver, route_url, click_filter=True)
+        except Exception as exc:
+            logger.debug(f"Не удалось посетить похожие объявления: {exc}")
+        finally:
+            try:
+                WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            except TimeoutException:
+                try:
+                    driver.get(origin_url)
+                    WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                except Exception:
+                    pass
+
+    def _selenium_warm_route(self, driver) -> None:
+        self._selenium_prepare_route(driver)
 
     def _parse_detailed_job_info(self, html_content: str, url: str):
         """Извлекает данные о вакансии из HTML-страницы."""
