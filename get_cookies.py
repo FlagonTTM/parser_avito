@@ -5,6 +5,7 @@ import httpx
 from loguru import logger
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
+import playwright
 from typing import Optional, Dict, List
 
 from dto import Proxy, ProxySplit
@@ -41,6 +42,10 @@ class PlaywrightClient:
         else:
             self.user_agent = DEFAULT_USER_AGENT
         self.context = self.page = self.browser = None
+        self.playwright = None
+        self._playwright_cm = None
+        self.last_cookie_url: Optional[str] = None
+        self._last_humanize = 0.0
     @staticmethod
     def check_protocol(ip_port: str) -> str:
         if "http://" not in ip_port:
@@ -82,6 +87,13 @@ class PlaywrightClient:
         return dict(pair.split("=", 1) for pair in cookie_str.split("; ") if "=" in pair)
     async def _restart_browser(self):
         """Закрывает текущий браузер и запускает новый с обновленными настройками."""
+        await self.close()
+        await self.ensure_browser()
+    async def ensure_browser(self):
+        if self.browser:
+            return
+        await self.launch_browser()
+    async def close(self):
         try:
             if self.page:
                 await self.page.close()
@@ -103,12 +115,19 @@ class PlaywrightClient:
             pass
         finally:
             self.browser = None
-        await self.launch_browser()
+        if self.playwright and self._playwright_cm:
+            try:
+                await self._playwright_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+        self.playwright = None
+        self._playwright_cm = None
     async def launch_browser(self):
+        if self.browser:
+            return
         stealth = Stealth()
-        self.playwright_context = stealth.use_async(async_playwright())
-        playwright = await self.playwright_context.__aenter__()
-        self.playwright = playwright
+        self._playwright_cm = stealth.use_async(async_playwright())
+        self.playwright = await self._playwright_cm.__aenter__()
         launch_args = {
             "headless": self.headless,
             "chromium_sandbox": False,
@@ -139,8 +158,9 @@ class PlaywrightClient:
         self.page = await self.context.new_page()
         await self._stealth(self.page)
     async def load_page(self, url: str):
+        await self.ensure_browser()
         await self.page.goto(url=url, timeout=60_000, wait_until="domcontentloaded")
-        for attempt in range(8):
+        for attempt in range(6):
             if await self.check_block(url):
                 url = self._random_listing_url()
                 await asyncio.sleep(1.5)
@@ -150,19 +170,14 @@ class PlaywrightClient:
             if cookie_dict.get("ft"):
                 logger.info("Cookies получены")
                 return cookie_dict
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
         logger.warning("Не удалось получить cookies")
         return {}
     async def extract_cookies(self, url: str) -> dict:
-        try:
-            await self.launch_browser()
-            return await self.load_page(url)
-        finally:
-            if hasattr(self, "browser"):
-                if self.browser:
-                    await self.browser.close()
-            if hasattr(self, "playwright"):
-                await self.playwright.stop()
+        await self.ensure_browser()
+        cookies = await self.load_page(url)
+        self.last_cookie_url = url
+        return cookies
     async def get_cookies(self, url: str) -> dict:
         return await self.extract_cookies(url)
     async def check_block(self, url: str) -> bool:
@@ -199,7 +214,7 @@ class PlaywrightClient:
 
         for attempt in range(1, retries + 1):
             try:
-                response = httpx.get(change_url, timeout=15, verify=False, proxies=None)
+                response = httpx.get(change_url, timeout=15, verify=False)
                 if response.status_code == 200:
                     try:
                         payload = response.json()
@@ -256,6 +271,59 @@ class PlaywrightClient:
     def _random_listing_url(self) -> str:
         ads_id = random.randint(1111111111, 9999999999)
         return f"https://www.avito.ru/{ads_id}"
+    def is_compatible(self, proxy: Proxy | None, user_agent: Optional[str]) -> bool:
+        normalized_proxy = self.del_protocol(proxy.proxy_string) if proxy else None
+        current_proxy = self.del_protocol(self.proxy.proxy_string) if self.proxy and self.proxy.proxy_string else None
+        ua = str(user_agent) if user_agent else self.user_agent
+        return normalized_proxy == current_proxy and ua == self.user_agent
+    async def humanize_session(self, extra_routes: Optional[List[str]] = None):
+        await self.ensure_browser()
+        routes = extra_routes or []
+        if not routes:
+            routes = [
+                "https://www.avito.ru/",
+                random.choice([
+                    "https://www.avito.ru/moskva/nedvizhimost",
+                    "https://www.avito.ru/rossiya/transport",
+                    "https://www.avito.ru/moskva/rabota",
+                    self._random_listing_url()
+                ])
+            ]
+        for url in routes:
+            try:
+                await self.page.goto(url, timeout=60_000, wait_until="domcontentloaded")
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+                await self._human_clicks()
+            except Exception as exc:
+                logger.debug(f"[Playwright humanize] Не удалось обработать {url}: {exc}")
+        self._last_humanize = asyncio.get_event_loop().time()
+    async def _human_clicks(self):
+        if not self.page:
+            return
+        try:
+            scroll_steps = random.randint(2, 5)
+            for _ in range(scroll_steps):
+                await self.page.mouse.wheel(0, random.randint(400, 900))
+                await asyncio.sleep(random.uniform(0.3, 0.7))
+            candidates = await self.page.query_selector_all("a[href^='https://www.avito.ru/']")
+            random.shuffle(candidates)
+            for candidate in candidates[:3]:
+                href = await candidate.get_attribute("href")
+                if not href:
+                    continue
+                try:
+                    await candidate.hover()
+                    await asyncio.sleep(random.uniform(0.2, 0.5))
+                    await candidate.click(button="left", delay=random.randint(40, 120))
+                    await self.page.wait_for_load_state("domcontentloaded", timeout=30_000)
+                    await asyncio.sleep(random.uniform(1.0, 2.0))
+                    await self.page.go_back()
+                    await self.page.wait_for_load_state("domcontentloaded", timeout=30_000)
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
     @staticmethod
     async def _stealth(page):
         await page.add_init_script("""
@@ -272,13 +340,70 @@ class PlaywrightClient:
             await route.abort()
         else:
             await route.continue_()
+class PlaywrightManager:
+    def __init__(self):
+        self.client: Optional[PlaywrightClient] = None
+        self.lock = asyncio.Lock()
+        self.last_cookie_refresh = 0.0
+        self.last_humanize = 0.0
+        self.cookie_refresh_interval = 240.0
+        self.humanize_interval = 300.0
+
+    async def _ensure_client(self, proxy: Proxy | None, user_agent: Optional[str]):
+        if self.client and not self.client.is_compatible(proxy, user_agent):
+            await self.client.close()
+            self.client = None
+        if not self.client:
+            self.client = PlaywrightClient(proxy=proxy, user_agent=user_agent)
+            await self.client.ensure_browser()
+        else:
+            await self.client.ensure_browser()
+
+    async def get_cookies(self, proxy: Proxy | None, user_agent: Optional[str]) -> tuple[dict, str]:
+        async with self.lock:
+            await self._ensure_client(proxy, user_agent)
+            assert self.client
+            target_url = self.client._random_listing_url()
+            cookies = await self.client.get_cookies(target_url)
+            self.last_cookie_refresh = asyncio.get_event_loop().time()
+            return cookies, self.client.user_agent
+
+    async def humanized_browse(self, proxy: Proxy | None, user_agent: Optional[str], routes: Optional[List[str]] = None):
+        async with self.lock:
+            await self._ensure_client(proxy, user_agent)
+            assert self.client
+            await self.client.humanize_session(routes)
+            self.last_humanize = asyncio.get_event_loop().time()
+
+    async def periodic_refresh(self, proxy: Proxy | None, user_agent: Optional[str]):
+        now = asyncio.get_event_loop().time()
+        if now - self.last_cookie_refresh > self.cookie_refresh_interval:
+            await self.get_cookies(proxy, user_agent)
+        if now - self.last_humanize > self.humanize_interval:
+            await self.humanized_browse(proxy, user_agent)
+
+    async def shutdown(self):
+        async with self.lock:
+            if self.client:
+                await self.client.close()
+                self.client = None
+
+
+_manager = PlaywrightManager()
+
+
 async def get_cookies(proxy: Proxy = None, headless: bool = True, user_agent: Optional[str] = None) -> tuple:
     logger.info("Пытаюсь обновить cookies")
-    client = PlaywrightClient(
-        proxy=proxy,
-        headless=headless,
-        user_agent=user_agent,
-    )
-    ads_id = str(random.randint(1111111111, 9999999999))
-    cookies = await client.get_cookies(f"https://www.avito.ru/{ads_id}")
-    return cookies, client.user_agent
+    return await _manager.get_cookies(proxy, user_agent)
+
+
+async def humanized_browse(proxy: Proxy = None, user_agent: Optional[str] = None, routes: Optional[List[str]] = None):
+    await _manager.humanized_browse(proxy, user_agent, routes)
+
+
+async def ensure_playwright_alive(proxy: Proxy = None, user_agent: Optional[str] = None):
+    await _manager.periodic_refresh(proxy, user_agent)
+
+
+async def shutdown_playwright():
+    await _manager.shutdown()
